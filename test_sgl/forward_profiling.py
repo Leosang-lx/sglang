@@ -1,10 +1,11 @@
 from sglang.srt.managers.scheduler import *
 from sglang.srt.managers.tokenizer_manager import *
 from sglang.srt.managers.io_struct import (
-    GenerateReqInput
+    GenerateReqInput, TokenizedGenerateReqInput,
 )
 from typing import List, Optional
 import torch
+import asyncio
 
 
 # tokenizer for profiling is unnecessary
@@ -36,7 +37,7 @@ def prepare_input_ids(
 
     # prepare extend inputs
     if extend_input_lens is None or len(extend_input_lens) == 0:
-        extend_input_ids = None
+        early_requests_obj = None
 
     else:  # extend requests exit
         assert extend_cache_lens is not None and len(extend_cache_lens) == len(extend_input_lens)
@@ -45,11 +46,26 @@ def prepare_input_ids(
 
         # generate extend requests (forward before the prefill requests)
         early_requests_obj = GenerateReqInput(
-            
+            input_ids=extend_cache_input_ids,   
         )
+        early_requests_obj.normalize_batch_and_arguments()
+
     
     req_input_ids = prefill_req_input_ids + extend_input_ids
-
     # todo: 这里应该要转成batch对应上req_id，要不然cache pool没法对应
+
+
+@torch.no_grad()
+def generate():
+    pass
+
+if __name__ == "__main__":
+    # specify lengths of prefill and extend requests
+    prefill_bs = 10
+    prefill_lens = [500] * prefill_bs
+    extend_bs = 20
+    extend_cache_lens = [500] * extend_bs
+    extend_input_lens = [1] * extend_bs
+
 
 
