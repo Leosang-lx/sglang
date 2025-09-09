@@ -43,6 +43,8 @@ tokenizer_manager:
       - 如果有prefill_batch不为空，则返回prefill_batch: **ScheduleBatch**
       - 否则返回running_batch: **ScheduleBatch**
   - forward：self.**run_batch**(batch: **ScheduleBatch**) + process_batch_result
+    - process_batch_result -> SchedulerOutputProcessorMixin.process_batch_result_prefill()
+      - 获取logits, next_token_ids, TODO!!!
   - 记录为last_batch
 
 **Forward**: 前向传播batch forward
@@ -53,7 +55,8 @@ scheduler.run_batch(ScheduleBatch)
 - self.tp_worker.forward_batch_generation(model_worker_batch) -> hidden_states & logits_output
 - last_rank: GenerationBatchResult(hidden_states & logits_output)
 
-tp_worker.forward_batch_generation(ModelWorkerBatch)
+tp_worker.forward_batch_generation(ModelWorkerBatch): 这里有skip_sample的选项（用于extend？）
+- skip_sample其实就是在这里返回的next_token_ids为None
 - **ModelWorkerBatch** -> **ForwardBatch**,包含了model_runner的attn_backend
 - tp_worker.model_runner.forward(forward_batch, pp_proxy_tensors)，这是PP的中间结果
 - 如果是last_rank：额外进行采样：next_token_ids = self.model_runner.sample(logits_output)
@@ -100,3 +103,8 @@ attn_backend.forward(q, k, v, layer, forward_batch, save_kv_cache)
   - forward_batch.token_to_kv_pool.set_kv_buffer(): 设置新的kv
   - o = prefill_wrapper_paged.forward(q, token_to_kv_pool.get_kv_buffer(layer.layer_id),...)
   - (再底层的就先不管了,看不懂)
+
+
+实现单个batch从input_ids到logits的batch forward流程
+接下来的followed batch怎么对应上？从Request级别来对应吗？
+

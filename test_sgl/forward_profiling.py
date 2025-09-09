@@ -182,10 +182,11 @@ class ForwardProfiler():
 
         early_batch = ForwardBatch.init_new(early_batch.get_model_worker_batch(), self.model_runner)
 
-
         return early_batch
-        
+
+        # extend_req_indices = early_batch.req_indices
         # process the real input batch
+        # test_batch = 
     
     def forward_batch(self, batch: ForwardBatch):
         return self.model_runner.forward_extend(batch)
@@ -207,8 +208,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     server_args = ServerArgs.from_cli_args(
+        # parse args in python
         parser.parse_args(args=[
-            '--model-path', model_path, '--mem-fraction-static', mem_frac,
+            '--model-path', model_path,
+            '--mem-fraction-static', mem_frac,
             ])
     )
     port_args = PortArgs.init_new(server_args)
@@ -239,12 +242,12 @@ if __name__ == "__main__":
     )
 
     print(f'extend_seq_lens: {early_batch.extend_seq_lens}')
-    print(f'input_ids: {early_batch.input_ids}, shape: {early_batch.input_ids.shape}')
+    print(f'input_ids shape: {early_batch.input_ids.shape}')
     # dist.destroy_process_group()
     # exit(0)
 
     ret = forward_profiler.forward_batch(early_batch)
-    # todo: 返回的结果没有sampling（要吗
+    # sampling: model_runner.sample(logits_output, forward_batch)
     # except:
     #     pass
     # finally:
