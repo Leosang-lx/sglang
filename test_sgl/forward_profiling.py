@@ -116,7 +116,7 @@ class ForwardProfiler():
         if prefill_req_lens is None or len(prefill_req_lens) == 0:
             prefill_req_input_ids = []
         else:
-            prefill_req_input_ids = [torch.randint(1, vocab_size, (1, prefill_req_len)) for prefill_req_len in prefill_req_lens]
+            prefill_req_input_ids = [torch.randint(1, vocab_size, (prefill_req_len,)) for prefill_req_len in prefill_req_lens]
 
         # prepare extend inputs
         if extend_input_lens is None or len(extend_input_lens) == 0:
@@ -124,8 +124,8 @@ class ForwardProfiler():
 
         else:  # extend requests exit
             assert extend_cache_lens is not None and len(extend_cache_lens) == len(extend_input_lens)
-            early_extend_input_ids = [torch.randint(1, vocab_size-10, (1, extend_cache_len)) for extend_cache_len in extend_cache_lens]
-            extend_req_input_ids = [torch.randint(1, vocab_size-10, (1, extend_input_len)) for extend_input_len in extend_input_lens]
+            early_extend_input_ids = [torch.randint(1, vocab_size-10, (extend_cache_len,)) for extend_cache_len in extend_cache_lens]
+            extend_req_input_ids = [torch.randint(1, vocab_size-10, (extend_input_len,)) for extend_input_len in extend_input_lens]
 
         req_input_ids = extend_req_input_ids + prefill_req_input_ids
         
@@ -141,9 +141,9 @@ class ForwardProfiler():
             Req(
                 rid=str(i),
                 origin_input_text=None,
-                origin_input_ids=input_ids[i],
-                sampling_params=None,  # todo!!!: prepare sampling_params: SamplingParams
-                # return_logprob=self.return_logprob,
+                origin_input_ids=input_ids[i].tolist(),
+                sampling_params=SamplingParams(temperature=0.0),  # prepare sampling_params: SamplingParams
+                # return_logprob=False,
                 # top_logprobs_num=self.top_logprobs_num,
                 # token_ids_logprob=self.token_ids_logprob,
             ) for i in range(len(input_ids))
@@ -152,16 +152,20 @@ class ForwardProfiler():
 
     def get_forward_batch(self, early_extend_input_ids, req_input_ids):
 
+        # sampling_params = [Sampling]
+
         # process the earlier one first
         batch_size = len(early_extend_input_ids)
         reqs = self.prepare_reqs(early_extend_input_ids)
-        req_pool_indices = self.model_runner.req_to_token_pool.get_pool_indices(
-            batch_size
-        )
-        seq_lens = torch.tensor([len(x) for x in early_extend_input_ids])
-        extend_num_tokens = seq_lens.sum().item()
-        out_cache_loc = ...  # token_to_kv_pool_allocator
-        return_logprob = any(req.return_logprob for req in reqs)
+        for r in reqs:
+            r.init_next_round_input()
+        # req_pool_indices = self.model_runner.req_to_token_pool.get_pool_indices(
+        #     batch_size
+        # )
+        # seq_lens = torch.tensor([len(x) for x in early_extend_input_ids])
+        # extend_num_tokens = seq_lens.sum().item()
+        # out_cache_loc = ...  # token_to_kv_pool_allocator
+        # return_logprob = any(req.return_logprob for req in reqs)
 
         early_batch = ScheduleBatch.init_new(
             reqs,
@@ -174,8 +178,9 @@ class ForwardProfiler():
             self.server_args.enable_custom_logit_processor,
             # chunked_req=self.chunked_req,
         )
+        early_batch.prepare_for_extend()
 
-        early_batch = ForwardBatch.init_new(early_batch.get_model_worker_batch())
+        early_batch = ForwardBatch.init_new(early_batch.get_model_worker_batch(), self.model_runner)
 
 
         return early_batch
@@ -183,7 +188,7 @@ class ForwardProfiler():
         # process the real input batch
     
     def forward_batch(self, batch: ForwardBatch):
-        return self.model_worker.forward_batch(batch)
+        return self.model_runner.forward_extend(batch)
     
 
 @torch.no_grad()
@@ -196,10 +201,16 @@ if __name__ == "__main__":
     tp_rank = 0
     moe_ep_rank = 0
     pp_rank = 0
+    model_path = '/home/liux/big_file/Qwen/Qwen3-8B/'
+    mem_frac = '0.6'
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
-    server_args = ServerArgs.from_cli_args(parser.parse_args())
+    server_args = ServerArgs.from_cli_args(
+        parser.parse_args(args=[
+            '--model-path', model_path, '--mem-fraction-static', mem_frac,
+            ])
+    )
     port_args = PortArgs.init_new(server_args)
 
     forward_profiler = ForwardProfiler(
@@ -213,8 +224,10 @@ if __name__ == "__main__":
 
     prefill_bs = 10
     prefill_lens = [100] * prefill_bs
+    # prefill_lens = [10] * 5 + [20] * 5
     extend_bs = 20
-    extend_cache_lens = [100] * extend_bs
+    # extend_cache_lens = [100] * extend_bs
+    extend_cache_lens = [10] * 10 + [20] * 10
     extend_input_lens = [1] * extend_bs
 
     # try:
@@ -225,7 +238,13 @@ if __name__ == "__main__":
         early_extend_input_ids, req_input_ids
     )
 
-    ret = forward_profiler.forward_batch()
+    print(f'extend_seq_lens: {early_batch.extend_seq_lens}')
+    print(f'input_ids: {early_batch.input_ids}, shape: {early_batch.input_ids.shape}')
+    # dist.destroy_process_group()
+    # exit(0)
+
+    ret = forward_profiler.forward_batch(early_batch)
+    # todo: 返回的结果没有sampling（要吗
     # except:
     #     pass
     # finally:
