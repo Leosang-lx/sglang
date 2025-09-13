@@ -136,9 +136,9 @@ class ForwardProfiler():
 
     def prepare_reqs(self, input_ids: list[torch.Tensor]):
         assert input_ids is not None and len(input_ids) > 0
-
-        reqs = [
-            Req(
+        reqs = []
+        for i in range(len(input_ids)):
+            req = Req(
                 rid=str(i),
                 origin_input_text=None,
                 origin_input_ids=input_ids[i].tolist(),
@@ -146,28 +146,15 @@ class ForwardProfiler():
                 # return_logprob=False,
                 # top_logprobs_num=self.top_logprobs_num,
                 # token_ids_logprob=self.token_ids_logprob,
-            ) for i in range(len(input_ids))
-        ]
+            )
+            req.init_next_round_input()
+            reqs.append(req)
+
         return reqs
-
-    def get_forward_batch(self, early_extend_input_ids, req_input_ids):
-
-        # sampling_params = [Sampling]
-
-        # process the earlier one first
-        batch_size = len(early_extend_input_ids)
-        reqs = self.prepare_reqs(early_extend_input_ids)
-        for r in reqs:
-            r.init_next_round_input()
-        # req_pool_indices = self.model_runner.req_to_token_pool.get_pool_indices(
-        #     batch_size
-        # )
-        # seq_lens = torch.tensor([len(x) for x in early_extend_input_ids])
-        # extend_num_tokens = seq_lens.sum().item()
-        # out_cache_loc = ...  # token_to_kv_pool_allocator
-        # return_logprob = any(req.return_logprob for req in reqs)
-
-        early_batch = ScheduleBatch.init_new(
+    
+    def get_schedule_batch_prefill(self, req_input_ids):
+        reqs = self.prepare_reqs(req_input_ids)
+        batch = ScheduleBatch.init_new(
             reqs,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
@@ -178,18 +165,79 @@ class ForwardProfiler():
             self.server_args.enable_custom_logit_processor,
             # chunked_req=self.chunked_req,
         )
-        early_batch.prepare_for_extend()
 
-        early_batch = ForwardBatch.init_new(early_batch.get_model_worker_batch(), self.model_runner)
+        return batch
+    
+    def set_extend_input(self, extend_batch: ScheduleBatch, new_extend_input):
+        assert len(extend_batch.reqs) == len(new_extend_input)
+        for req, extend_input in zip(extend_batch.reqs, new_extend_input):
+            # req.prefix_indices = torch.concat([req.prefix_indices, req.fill_ids[len(req.prefix_indices):]])
+            req.prefix_indices = torch.tensor(req.fill_ids, dtype=torch.int32)
+            req.origin_input_ids.extend(extend_input.tolist())
+            # req.fill_ids.extend(extend_input.tolist())
+            req.init_next_round_input()
 
-        return early_batch
+    def merge_extend_batch(self, batch1: ScheduleBatch, batch2: ScheduleBatch):
+        # simplipied ScheduleBatch.merge_batch() for extend forward profiling
+        # before prepare_for_extend()
+
+        # batch1.sampling_info.merge_batch(batch2.sampling_info)
+        batch1.reqs.extend(batch2.reqs)
+        if batch1.spec_info:
+            batch1.spec_info.merge_batch(batch2.spec_info)
+        
+        return batch1
+        # batch1.req_pool_indices = torch.cat(
+        #     [batch1.req_pool_indices, batch2]
+        # )
+
+    def prefill_then_extend(self, early_extend_input_ids, req_input_ids):
+
+        # sampling_params = [SamplingParams]
+
+        early_bs = len(early_extend_input_ids)
+        
+        # prepare the first batch
+        extend_batch = self.get_schedule_batch_prefill(early_extend_input_ids)
+        extend_batch.prepare_for_extend()
+        extend_forward_batch = ForwardBatch.init_new(extend_batch.get_model_worker_batch(), self.model_runner)
+        
+
+        # forward the first batch
+        ret = self.model_runner.forward(extend_forward_batch)
+
+        # prepare the second batch
+        extend_input_ids = req_input_ids[:early_bs]
+        # extend_input_ids for the early batch
+        self.set_extend_input(extend_batch, extend_input_ids)
+        # extend_batch.input_ids = extend_input_ids
+        # extend_batch.prepare_for_extend()
+
+        # prepare the prefill batch
+        prefill_input_ids = req_input_ids[early_bs:]
+        prefill_batch = self.get_schedule_batch_prefill(prefill_input_ids)
+        # prefill_batch.prepare_for_extend()
+
+
+        # extend_batch.merge_batch(prefill_batch)  # merge_batch没有merge prefix_lens
+        extend_batch = self.merge_extend_batch(extend_batch, prefill_batch)
+        # extend_batch.prefix_lens.extend(prefill_batch.prefix_lens)
+        extend_batch.prepare_for_extend()
+        extend_forward_batch = ForwardBatch.init_new(extend_batch.get_model_worker_batch(), self.model_runner)
+        # extend_batch.prepare_for_extend()
+        
+        # forward the merged prefill & extend batch
+        ret = self.model_runner.forward(extend_forward_batch)
+
+
+        return ret
 
         # extend_req_indices = early_batch.req_indices
         # process the real input batch
         # test_batch = 
     
-    def forward_batch(self, batch: ForwardBatch):
-        return self.model_runner.forward_extend(batch)
+    # def forward_batch(self, batch: ForwardBatch):
+    #     return self.model_runner.forward_extend(batch)
     
 
 @torch.no_grad()
@@ -212,6 +260,7 @@ if __name__ == "__main__":
         parser.parse_args(args=[
             '--model-path', model_path,
             '--mem-fraction-static', mem_frac,
+            '--disable-radix-cache',
             ])
     )
     port_args = PortArgs.init_new(server_args)
@@ -233,24 +282,31 @@ if __name__ == "__main__":
     extend_cache_lens = [10] * 10 + [20] * 10
     extend_input_lens = [1] * extend_bs
 
-    # try:
-    early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
-        prefill_lens, extend_cache_lens, extend_input_lens
-    )
-    early_batch = forward_profiler.get_forward_batch(
-        early_extend_input_ids, req_input_ids
-    )
+    try:
+        early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
+            prefill_lens, extend_cache_lens, extend_input_lens
+        )
 
-    print(f'extend_seq_lens: {early_batch.extend_seq_lens}')
-    print(f'input_ids shape: {early_batch.input_ids.shape}')
+        # early_batch = forward_profiler.get_forward_batch(
+        #     early_extend_input_ids, req_input_ids
+        # )
+
+        ret = forward_profiler.prefill_then_extend(
+            early_extend_input_ids, req_input_ids
+        )
+
+    # print(f'extend_seq_lens: {early_batch.extend_seq_lens}')
+    # print(f'input_ids shape: {early_batch.input_ids.shape}')
     # dist.destroy_process_group()
     # exit(0)
 
-    ret = forward_profiler.forward_batch(early_batch)
+        # ret = forward_profiler.forward_batch(early_batch)
     # sampling: model_runner.sample(logits_output, forward_batch)
-    # except:
-    #     pass
-    # finally:
-    dist.destroy_process_group()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # raise e
+    finally:
+        dist.destroy_process_group()
 
 

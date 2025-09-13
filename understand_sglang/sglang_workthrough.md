@@ -37,15 +37,33 @@ tokenizer_manager:
       - 基于recv_req中的信息生成req = **Req**()（类型转换）
       - prefetch_kvcache + append **Req** to waiting_queue
   - 决定这一轮的forward batch: get_next_batch_to_run()
+    - 整理chunked-prefill reqs
+    - new_batch = get_new_batch_prefill()
+      - 获得新的prefill请求
+      - PrefillAdder添加prefill&extend请求生成can_run_list
+      - new_batch = **ScheduleBatch**.init_new()
+      - new_batch.**prepare_for_extend**()
+        - req_pool_indices = self.alloc_req_slots(bs): 分配req slots
+          - 这个是啥？和rid的区别是什么？
+        - 初始化forward batch相关张量：
+          - input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+            - 看起来r.fill_ids像是某个请求的当前所有前缀长度，prefix_indices是已经在cache中的部分
+            - extend_num_tokens是这个batch的所有extend input tokens数
+            - seq_lens是batch中各个请求的长度
+            - prefix_lens是batch请求中已有cache部分的长度
+            - extend_lens就是batch各请求的extend input tokens长度
     - 如果有prefill，优先处理
     - 把完成prefill的request放进running_batch: running_batch即可以进行decode的batch
-      - 判断该轮是否有prefill请求：preill & chunked prefill: get_new_prefill_batch
+      - 判断该轮是否有prefill请求：preill & chunked prefill: get_new_prefill_batch()
+        - 
       - 如果有prefill_batch不为空，则返回prefill_batch: **ScheduleBatch**
       - 否则返回running_batch: **ScheduleBatch**
-  - forward：self.**run_batch**(batch: **ScheduleBatch**) + process_batch_result
-    - process_batch_result -> SchedulerOutputProcessorMixin.process_batch_result_prefill()
-      - 获取logits, next_token_ids, TODO!!!
+  - forward：self.**run_batch**(batch: **ScheduleBatch**)
+  - process_batch_result() -> SchedulerOutputProcessorMixin.process_batch_result_prefill()
+      - 获取logits, next_token_ids
+      - 基本上是把该轮每个req生成的token_id保存到req.ouput_ids中
   - 记录为last_batch
+
 
 **Forward**: 前向传播batch forward
 问题：这里的cache是如何管理和更新的？
@@ -108,3 +126,16 @@ attn_backend.forward(q, k, v, layer, forward_batch, save_kv_cache)
 实现单个batch从input_ids到logits的batch forward流程
 接下来的followed batch怎么对应上？从Request级别来对应吗？
 
+投机解码：scheduler.draft_worker.forward_batch_generation(batch)
+- scheduler.draft_worker: EAGLEWorker(TPWorker)
+  - EAGLEWorker.forward_batch_generation(batch: ScheduleBatch)
+  - 第一轮：prefill: batch.forward_mode.is_extend()
+    - 直接调用forward_target_extend+
+  - 后面轮：draft+verification:
+    - 先draft: spec_info = self.draft(batch)
+      - batch里面应该有上一轮生成的tokens（接收的+采样的）：因为self.draft(batch)需要这些token来extend
+    - 再verify: logits_output, verify_output, model_worker_batch, _ = self.verify(batch, spec_info)
+      - verify时target的extend则将整个草稿树作为输入（根节点为上一轮采样出来的token）
+      - spec_info: EagleVerifyInput.**prepare_for_verify**(batch, self.page_size)
+        - batch.input_ids = self.draft_tokens: 这里将spec_info的draft_tokens同步给batch:ScheduleBatch
+        - batch剩余推理步骤跟之前的是一致的，**说明**应该不是按照req_pool_indices区分requests的cache，确定一下是不是Req中的rid？
