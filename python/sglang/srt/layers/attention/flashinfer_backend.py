@@ -456,6 +456,10 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Add for uncaching
+        if forward_batch.save_cache is False:
+            save_kv_cache = False
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]

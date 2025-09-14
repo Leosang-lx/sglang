@@ -299,6 +299,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # add for uncaching
+    save_cache: bool = True
+
     @classmethod
     def init_new(
         cls,
@@ -339,6 +342,9 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
+        # add for uncaching
+        if batch.out_cache_loc is None:
+            ret.save_cache = False
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
