@@ -1,6 +1,7 @@
 import argparse
 import time
-from typing import List, Optional
+from typing import List, Optional, Generator
+# from types import GeneratorType
 import torch
 import torch.distributed as dist
 from profiler.profiler import prof
@@ -128,6 +129,7 @@ class ForwardProfiler():
         # prepare extend inputs
         if extend_input_lens is None or len(extend_input_lens) == 0:
             early_extend_input_ids = None
+            extend_req_input_ids = []
 
         else:  # extend requests exit
             assert extend_cache_lens is not None and len(extend_cache_lens) == len(extend_input_lens)
@@ -218,7 +220,7 @@ class ForwardProfiler():
         #     [batch1.req_pool_indices, batch2]
         # )
 
-    def prefill_then_extend(self, early_extend_input_ids, req_input_ids, prof=None):
+    def prefill_then_extend(self, early_extend_input_ids, req_input_ids, prof=None, name=None):
 
         if early_extend_input_ids is not None:  # extend requests exist
             # sampling_params = [SamplingParams]
@@ -256,14 +258,51 @@ class ForwardProfiler():
             
         extend_batch.prepare_for_extend(save_cache=False)
         extend_forward_batch = ForwardBatch.init_new(extend_batch.get_model_worker_batch(), self.model_runner)
+
+        name = name if name else 'batch forward'
         
         # forward the merged prefill & extend batch
         for _ in range(10):
-            with prof.profile_context('batch forward pipeline', device=f'cuda:{gpu_id}') if prof else nullcontext():
+            with prof.profile_context(name, device=f'cuda:{gpu_id}') if prof else nullcontext():
                 ret, _ = self.model_runner.forward(extend_forward_batch)
 
         return ret
     
+    def clear_cache(self):
+        self.tree_cache.reset()
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool_allocator.clear()
+
+def prepare_single_prefill_forward_input():
+    prefill_lens = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    for prefill_len in prefill_lens:
+        early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
+            [prefill_len], None, None
+        )
+        prof_name = f'prefill_len={prefill_len} forward'
+        yield (early_extend_input_ids, req_input_ids), prof_name
+
+def prepare_batched_decode_forward_input():
+    extend_bs = [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
+    extend_cache_len = 100
+    extend_req_input_len = 1
+    for bs in extend_bs: 
+        extend_cache_lens = [extend_cache_len] * bs
+        extend_req_input_lens = [extend_req_input_len] * bs
+        early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
+            [], extend_cache_lens, extend_req_input_lens
+        )
+        prof_name = f'batch decode {bs}*({extend_cache_len}+={extend_req_input_len}) forward'
+        yield (early_extend_input_ids, req_input_ids), prof_name
+
+def forward_profiling(input_generators: Generator, forward_profiler: ForwardProfiler):
+    for (early_extend_input_ids, req_input_ids), prof_name in input_generators:
+        forward_profiler.clear_cache()
+        ret = forward_profiler.prefill_then_extend(
+            early_extend_input_ids, req_input_ids, prof, prof_name
+        )
+
+
 
 @torch.no_grad()
 def generate():
@@ -300,24 +339,24 @@ if __name__ == "__main__":
     )
 
     # extend & decoding requests
-    extend_bs = 1
+    extend_bs = 0
     # extend_cache_lens = [100] * extend_bs
     extend_cache_lens = [1] * extend_bs
     extend_input_lens = [1] * extend_bs
     # prefill requests
     prefill_bs = 1
-    prefill_lens = [1] * prefill_bs
+    # prefill_lens = [50] * prefill_bs
     # prefill_lens = [10] * 5 + [20] * 5
+    prefill_len = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    prefill_lenss = [[prefill_lens] * prefill_bs for prefill_lens in prefill_len]
 
 
     try:
-        early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
-            prefill_lens, extend_cache_lens, extend_input_lens
-        )
+        # prefill_input_g = prepare_single_prefill_forward_input()
+        # forward_profiling(prefill_input_g, forward_profiler)
+        extend_input_g = prepare_batched_decode_forward_input()
+        forward_profiling(extend_input_g, forward_profiler)
 
-        ret = forward_profiler.prefill_then_extend(
-            early_extend_input_ids, req_input_ids, prof
-        )
 
     # sampling: model_runner.sample(logits_output, forward_batch)
     except Exception as e:

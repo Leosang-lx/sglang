@@ -31,7 +31,7 @@ class Profiler:
         Start recording time for a named section. Supports multiple starts.
         """
 
-        self.start_tag = 'pipeline' in name
+        self.start_tag = 'forward' in name  # must use "forward" to enter
         if self.start_tag:
             self.cumulative_time_events.append(
                 {

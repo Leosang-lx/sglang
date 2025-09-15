@@ -1132,6 +1132,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req_pool_indices.extend(
                     self.alloc_req_slots(bs - len(self.req_pool_indices))
                 )
+            else: # len(req_pool_indices) == bs: already allocated
+                req_pool_indices = self.req_pool_indices.tolist()
 
         # Init tensors
         reqs = self.reqs
