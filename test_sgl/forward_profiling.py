@@ -273,8 +273,20 @@ class ForwardProfiler():
         self.req_to_token_pool.clear()
         self.token_to_kv_pool_allocator.clear()
 
+def prepare_warmup_input():
+    # extend
+    bs = 10
+    extend_cache_len = 100
+    extend_req_input_len = 100
+    early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
+        [], [extend_cache_len] * bs, [extend_req_input_len] * bs
+    )
+    yield (early_extend_input_ids, req_input_ids), 'warmup'
+
+
 def prepare_single_prefill_forward_input():
-    prefill_lens = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    prefill_lens = [1]
+    prefill_lens.extend(list(range(100, 2001, 100)))
     for prefill_len in prefill_lens:
         early_extend_input_ids, req_input_ids = forward_profiler.prepare_input_ids(
             [prefill_len], None, None
@@ -283,8 +295,9 @@ def prepare_single_prefill_forward_input():
         yield (early_extend_input_ids, req_input_ids), prof_name
 
 def prepare_batched_decode_forward_input():
-    extend_bs = [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
-    extend_cache_len = 100
+    # extend_bs = [1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    extend_bs = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    extend_cache_len = 127
     extend_req_input_len = 1
     for bs in extend_bs: 
         extend_cache_lens = [extend_cache_len] * bs
@@ -295,18 +308,13 @@ def prepare_batched_decode_forward_input():
         prof_name = f'batch decode {bs}*({extend_cache_len}+={extend_req_input_len}) forward'
         yield (early_extend_input_ids, req_input_ids), prof_name
 
-def forward_profiling(input_generators: Generator, forward_profiler: ForwardProfiler):
+def forward_profiling(input_generators: Generator, forward_profiler: ForwardProfiler, prof=None):
     for (early_extend_input_ids, req_input_ids), prof_name in input_generators:
         forward_profiler.clear_cache()
         ret = forward_profiler.prefill_then_extend(
             early_extend_input_ids, req_input_ids, prof, prof_name
         )
 
-
-
-@torch.no_grad()
-def generate():
-    pass
 
 if __name__ == "__main__":
     # specify lengths of prefill and extend requests
@@ -337,25 +345,18 @@ if __name__ == "__main__":
         server_args,
         port_args,
     )
-
-    # extend & decoding requests
-    extend_bs = 0
-    # extend_cache_lens = [100] * extend_bs
-    extend_cache_lens = [1] * extend_bs
-    extend_input_lens = [1] * extend_bs
-    # prefill requests
-    prefill_bs = 1
-    # prefill_lens = [50] * prefill_bs
-    # prefill_lens = [10] * 5 + [20] * 5
-    prefill_len = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-    prefill_lenss = [[prefill_lens] * prefill_bs for prefill_lens in prefill_len]
-
-
     try:
+        # warmup
+        print('Warmup...')
+        warm_up_input = prepare_warmup_input()
+        forward_profiling(warm_up_input, forward_profiler)
+
+        # profiling
+        print('Profiling...')
         # prefill_input_g = prepare_single_prefill_forward_input()
-        # forward_profiling(prefill_input_g, forward_profiler)
+        # forward_profiling(prefill_input_g, forward_profiler, prof)
         extend_input_g = prepare_batched_decode_forward_input()
-        forward_profiling(extend_input_g, forward_profiler)
+        forward_profiling(extend_input_g, forward_profiler, prof)
 
 
     # sampling: model_runner.sample(logits_output, forward_batch)
