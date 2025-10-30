@@ -37,6 +37,8 @@ class ForwardProfiler():
         pp_rank: int,
         server_args: ServerArgs,
         port_args: PortArgs,
+        tp_size: int = 1,
+        pp_size: int = 1,
     ):
         self.server_args = server_args
         self.model_config = ModelConfig.from_server_args(
@@ -318,11 +320,21 @@ def forward_profiling(input_generators: Generator, forward_profiler: ForwardProf
 
 if __name__ == "__main__":
     # specify lengths of prefill and extend requests
-    gpu_id = 1  # set located gpu
+    gpu_id = 0  # set located gpu
     tp_rank = 0
     moe_ep_rank = 0
     pp_rank = 0
-    model_path = '/home/liux/big_file/Qwen/Qwen3-8B/'
+    
+    prefix = '/home/liux/big_file'
+
+    # model_id = 'Qwen/Qwen3-8B'
+    # model_id = 'meta-llama/Meta-Llama-3-8B-Instruct'
+    model_id = 'lmsys/vicuna-13b-v1.3'
+    # model_id = 'meta-llama/Llama-2-13b-chat-hf'
+    # model_id = 'meta-llama/Llama-3.3-70B-Instruct'
+
+    model_path = f'{prefix}/{model_id}'
+
     mem_frac = '0.5'  # max-gpu-mem-usage
 
     parser = argparse.ArgumentParser()

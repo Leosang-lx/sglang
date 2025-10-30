@@ -235,8 +235,32 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
+def prepare_custom_synthetic_inputs(prefill_lens=None, extend_prefix_lens=None, extend_lens=None):
+    """
+    support both prefill and extend
+    """
+    if prefill_lens is None or len(prefill_lens) == 0:
+        prefill_inputs = None
+    else:
+        assert 0 not in prefill_lens, '0-length prefill is meaningless'
+        prefill_inputs = [list(np.random.randint(0, 10000, (1, l))) for l in prefill_lens]
+    
+    assert extend_prefix_lens is None == extend_lens is None, 'extend_prefix_lens and extend_lens cannot be both None or not None'
+
+    if extend_prefix_lens is not None and len(extend_prefix_lens):
+        assert len(extend_prefix_lens) == len(extend_lens)
+        extend_prefixes = [list(np.random.randint(0, 10000, (1, l))) for l in extend_prefix_lens]
+        extend_inputs = [list(np.random.randint(0, 10000, (1, l))) for l in extend_lens]
+    
+    else:
+        extend_prefixes = None
+        extend_inputs = None
+
+    return prefill_inputs, (extend_prefixes, extend_inputs)
+
+
 @torch.no_grad
-def extend(reqs, model_runner):
+def extend(reqs, model_runner, sample=True):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -252,20 +276,24 @@ def extend(reqs, model_runner):
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits, batch
+    if sample:
+        next_token_ids = model_runner.sample(logits_output, forward_batch)
+        return next_token_ids, logits_output.next_token_logits, batch
+    return None, logits_output.next_token_logits, batch
 
 
 @torch.no_grad
-def decode(input_token_ids, batch, model_runner):
+def decode(input_token_ids, batch, model_runner, sample=True):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
-    return next_token_ids, logits_output.next_token_logits
+    if sample:
+        next_token_ids = model_runner.sample(logits_output, forward_batch)
+        return next_token_ids, logits_output.next_token_logits
+    return None, logits_output.next_token_logits
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
@@ -432,6 +460,114 @@ def latency_test_run_once(
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
     return measurement_results
+
+def prepare_custom_inputs_for_latency_test(input_ids):    
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_new_tokens=BenchArgs.output_len,
+    )
+
+    reqs = []
+    for i, inputs in enumerate(input_ids):
+        req = Req(
+            rid=i,
+            origin_input_text="",
+            origin_input_ids=list(inputs),
+            sampling_params=sampling_params,
+        )
+        req.prefix_indices = []
+        req.fill_ids = req.origin_input_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+        req.logprob_start_len = len(req.origin_input_ids) - 1
+        reqs.append(req)
+    
+    return reqs
+
+def latency_test_custom_batch_once(
+    run_name,
+    model_runner,
+    rank_print,
+    prefill_reqs,
+    extend_reqs_inputs,
+    prefill_lens,
+    extend_lenss,
+    device,
+    profile,
+    profile_filename_prefix,
+):
+    extend_prefix_lens, extend_input_lens = extend_lenss
+    total_prefix = sum(extend_prefix_lens) if extend_prefix_lens else 0
+    total_input_tokens = sum(prefill_lens) if prefill_lens else 0 + sum(extend_input_lens) if extend_input_lens else 0
+    total_tokens = total_prefix + total_input_tokens
+    
+    if total_tokens > model_runner.max_total_num_tokens:
+        rank_print(
+            f"skipping this batch (total {total_tokens}) due to max total tokens (max {model_runner.max_total_num_tokens}) limit"
+        )
+        return
+    
+    # Clear the pools
+    model_runner.req_to_token_pool.clear()
+    model_runner.token_to_kv_pool_allocator.clear()
+
+    measurement_results = {
+        "run_name": run_name,
+        "total_prefix": total_prefix,
+        "total_input": total_input_tokens,
+    }
+
+    tot_latency = 0
+
+    prefix_ids, (extend_prefix_ids, extend_input_ids) = prepare_custom_inputs_for_latency_test(
+        prefill_lens, 
+    )
+
+    if prefill_reqs:
+        prefill_batch = ScheduleBatch.init_new(
+            reqs=prefill_reqs,
+            req_to_token_pool=model_runner.req_to_token_poo,
+            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+            tree_cache=None,
+            model_config=model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            enable_custom_logit_processor=False,
+        )
+        prefill_batch.prepare_for_extend()
+    else:
+        prefill_batch = None
+
+    extend_reqs, extend_inputs = extend_reqs_inputs
+
+    profiler = None
+    if profile:
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_stack=True,
+        )
+        profiler.start()
+    
+    # prefixes of extend batch
+    if extend_reqs_inputs is not None:  # reqs -> prefix tokens
+        _, _, extend_batch = extend(extend_reqs, model_runner, sample=False)
+        extend_batch.output_ids = extend_inputs
+        extend_batch.prepare_for_extend()  # fixme: prepare for extend方法无法将output_ids变为input_ids
+
+        if extend_batch and prefill_batch:
+            # merge with prefill batch
+            extend_batch.merge_batch(prefill_batch)
+            _maybe_prepare_mlp_sync_batch(extend_batch, model_runner)
+
+    else:  # only the prefill batch
+        extend_batch = prefill_batch
+    
+    model_worker_batch = extend_batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    logits_output, _ = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch)
 
 
 def latency_test(
