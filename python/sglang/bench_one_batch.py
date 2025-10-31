@@ -51,7 +51,7 @@ import multiprocessing
 import os
 import time
 from typing import Tuple
-
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -92,6 +92,9 @@ class BenchArgs:
     profile: bool = False
     profile_filename_prefix: str = "profile"
 
+    # add for customize test
+    custom_batch: bool = False
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
@@ -124,6 +127,12 @@ class BenchArgs:
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+        )
+        # add for customize test
+        parser.add_argument(
+            "--custom-batch",
+            action="store_true",
+            help="Use custom batch size defined in .py for testing.",
         )
 
     @classmethod
@@ -235,10 +244,15 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
-def prepare_custom_synthetic_inputs(prefill_lens=None, extend_prefix_lens=None, extend_lens=None):
+def prepare_custom_synthetic_inputs(prefill_lens=None, extend_lenss=None):
     """
     support both prefill and extend
     """
+    if extend_lenss is None:
+        extend_prefix_lens, extend_lens = None, None
+    else:
+        extend_prefix_lens, extend_lens = extend_lenss
+
     if prefill_lens is None or len(prefill_lens) == 0:
         prefill_inputs = None
     else:
@@ -472,7 +486,7 @@ def prepare_custom_inputs_for_latency_test(input_ids):
         req = Req(
             rid=i,
             origin_input_text="",
-            origin_input_ids=list(inputs),
+            origin_input_ids=list(inputs[0]),
             sampling_params=sampling_params,
         )
         req.prefix_indices = []
@@ -494,6 +508,7 @@ def latency_test_custom_batch_once(
     device,
     profile,
     profile_filename_prefix,
+    repeat=10,
 ):
     extend_prefix_lens, extend_input_lens = extend_lenss
     total_prefix = sum(extend_prefix_lens) if extend_prefix_lens else 0
@@ -516,16 +531,14 @@ def latency_test_custom_batch_once(
         "total_input": total_input_tokens,
     }
 
-    tot_latency = 0
-
-    prefix_ids, (extend_prefix_ids, extend_input_ids) = prepare_custom_inputs_for_latency_test(
-        prefill_lens, 
-    )
+    # prefix_ids, (extend_prefix_ids, extend_input_ids) = prepare_custom_inputs_for_latency_test(
+    #     prefill_lens, 
+    # )
 
     if prefill_reqs:
         prefill_batch = ScheduleBatch.init_new(
             reqs=prefill_reqs,
-            req_to_token_pool=model_runner.req_to_token_poo,
+            req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
             tree_cache=None,
             model_config=model_runner.model_config,
@@ -533,14 +546,15 @@ def latency_test_custom_batch_once(
             spec_algorithm=SpeculativeAlgorithm.NONE,
             enable_custom_logit_processor=False,
         )
-        prefill_batch.prepare_for_extend()
+        prefill_batch.prepare_for_extend(save_cache=False)
     else:
         prefill_batch = None
 
-    extend_reqs, extend_inputs = extend_reqs_inputs
+    # extend_reqs, extend_inputs = extend_reqs_inputs
 
     profiler = None
     if profile:
+        profile_filename = f"{profile_filename_prefix}_prefix{total_prefix}_extend{total_input_tokens}.trace.json.gz"
         profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -551,10 +565,13 @@ def latency_test_custom_batch_once(
         profiler.start()
     
     # prefixes of extend batch
+    # if extend_reqs is not None:
+
     if extend_reqs_inputs is not None:  # reqs -> prefix tokens
+        extend_reqs, extend_inputs = extend_reqs_inputs
         _, _, extend_batch = extend(extend_reqs, model_runner, sample=False)
         extend_batch.output_ids = extend_inputs
-        extend_batch.prepare_for_extend()  # fixme: prepare for extend方法无法将output_ids变为input_ids
+        extend_batch.prepare_for_extend(save_cache=False)  # fixme: prepare for extend方法无法将output_ids变为input_ids
 
         if extend_batch and prefill_batch:
             # merge with prefill batch
@@ -563,11 +580,24 @@ def latency_test_custom_batch_once(
 
     else:  # only the prefill batch
         extend_batch = prefill_batch
+
+    total_latency = []
+
+    for i in range(repeat):
+        synchronize(device)
+        tic = time.perf_counter()
+        model_worker_batch = extend_batch.get_model_worker_batch()
+        forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+        logits_output, _ = model_runner.forward(forward_batch)
+        next_token_ids = model_runner.sample(logits_output, forward_batch)
+        synchronize(device)
+        forward_latency = time.perf_counter() - tic
+        total_latency.append(forward_latency)
     
-    model_worker_batch = extend_batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    avg_latency = np.mean(forward_latency)
+    measurement_results['average_latency'] = avg_latency
+    # measurement_results['records'] = total_latency
+    return measurement_results
 
 
 def latency_test(
@@ -612,25 +642,62 @@ def latency_test(
 
     # Run the sweep
     result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
-        ret = latency_test_run_once(
-            bench_args.run_name,
-            model_runner,
-            rank_print,
-            reqs,
-            bs,
-            il,
-            ol,
-            server_args.device,
-            bench_args.log_decode_step,
-            bench_args.profile if tp_rank == 0 else None,
-            bench_args.profile_filename_prefix,
-        )
-        if ret is not None:
-            result_list.append(ret)
+    if bench_args.custom_batch:
+        print('Test custom batch')
+        assert 'custom_batch_lens' in globals()
+
+        for prefill_lens, extend_lenss in tqdm(custom_batch_lens):
+            
+            prefill_inputs, (extend_prefixes, extend_inputs) = prepare_custom_synthetic_inputs(
+                prefill_lens, extend_lenss,
+            )
+
+            if prefill_inputs is None:
+                prefill_reqs = None
+            else:
+                prefill_reqs = prepare_custom_inputs_for_latency_test(prefill_inputs)        
+
+            if extend_prefixes is None:
+                extend_reqs = None
+            else:
+                extend_reqs = prepare_custom_inputs_for_latency_test(extend_prefixes), extend_inputs
+
+            ret = latency_test_custom_batch_once(
+                bench_args.run_name,
+                model_runner,
+                rank_print,
+                prefill_reqs,
+                extend_reqs,
+                prefill_lens,
+                (extend_prefixes, extend_inputs),
+                server_args.device,
+                bench_args.profile if tp_rank == 0 else None,
+                bench_args.profile_filename_prefix,
+            )
+            if ret is not None:
+                result_list.append(ret)
+
+    else:  # normal batch
+        print('Test normal batch')
+        for bs, il, ol in itertools.product(
+            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+        ):
+            reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+            ret = latency_test_run_once(
+                bench_args.run_name,
+                model_runner,
+                rank_print,
+                reqs,
+                bs,
+                il,
+                ol,
+                server_args.device,
+                bench_args.log_decode_step,
+                bench_args.profile if tp_rank == 0 else None,
+                bench_args.profile_filename_prefix,
+            )
+            if ret is not None:
+                result_list.append(ret)
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:
@@ -683,17 +750,46 @@ def main(server_args, bench_args):
         proc.terminate()
 
 
+def gen_multi_custom_prefill_batches(multi_prefill_lens, batch_size=1):
+    """
+    Generate equal size batches of prefill and extend requests
+    """
+    # only prefill batch
+    if isinstance(multi_prefill_lens[0], list):
+        return [(pl, None) for pl in multi_prefill_lens]
+    custom_batch_lens = [([pl] * batch_size, None) for pl in multi_prefill_lens]
+    return custom_batch_lens
+
+def gen_multi_custom_extend_batches(multi_extend_prefix_len, multi_extend_input_len, batch_sizes):
+    # only extend batch
+    assert isinstance(batch_sizes, list)
+    custom_batch_lens = [(None, [multi_extend_prefix_len] * bs, [multi_extend_input_len] * bs) for bs in batch_sizes]
+    return custom_batch_lens
+
+
 if __name__ == "__main__":
+    prefix = '/home/liux/big_file'
+    model_id = 'Qwen/Qwen3-8B'
+    # model_id = 'lmsys/vicuna-13b-v1.3'
+    model_path = f'{prefix}/{model_id}'
+
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
-    args = parser.parse_args()
+    args = parser.parse_args(args=[
+        '--model-path', model_path,
+        '--custom-batch',
+    ])
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
+    )
+
+    custom_batch_lens = gen_multi_custom_prefill_batches(
+        [list(range(1, 101))] * 5
     )
 
     try:
