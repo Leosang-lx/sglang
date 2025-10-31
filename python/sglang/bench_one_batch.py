@@ -257,14 +257,14 @@ def prepare_custom_synthetic_inputs(prefill_lens=None, extend_lenss=None):
         prefill_inputs = None
     else:
         assert 0 not in prefill_lens, '0-length prefill is meaningless'
-        prefill_inputs = [list(np.random.randint(0, 10000, (1, l))) for l in prefill_lens]
+        prefill_inputs = [list(np.random.randint(0, 10000, (l,))) for l in prefill_lens]
     
-    assert extend_prefix_lens is None == extend_lens is None, 'extend_prefix_lens and extend_lens cannot be both None or not None'
+    assert (extend_prefix_lens is None) == (extend_lens is None), 'extend_prefix_lens and extend_lens cannot be both None or not None'
 
     if extend_prefix_lens is not None and len(extend_prefix_lens):
         assert len(extend_prefix_lens) == len(extend_lens)
-        extend_prefixes = [list(np.random.randint(0, 10000, (1, l))) for l in extend_prefix_lens]
-        extend_inputs = [list(np.random.randint(0, 10000, (1, l))) for l in extend_lens]
+        extend_prefixes = [list(np.random.randint(0, 10000, (l,))) for l in extend_prefix_lens]
+        extend_inputs = [list(np.random.randint(0, 10000, (l,))) for l in extend_lens]
     
     else:
         extend_prefixes = None
@@ -374,7 +374,7 @@ def correctness_test(
 def synchronize(device):
     torch.get_device_module(device).synchronize()
 
-
+@torch.no_grad
 def latency_test_run_once(
     run_name,
     model_runner,
@@ -486,7 +486,7 @@ def prepare_custom_inputs_for_latency_test(input_ids):
         req = Req(
             rid=i,
             origin_input_text="",
-            origin_input_ids=list(inputs[0]),
+            origin_input_ids=list(inputs),
             sampling_params=sampling_params,
         )
         req.prefix_indices = []
@@ -510,7 +510,11 @@ def latency_test_custom_batch_once(
     profile_filename_prefix,
     repeat=10,
 ):
-    extend_prefix_lens, extend_input_lens = extend_lenss
+    if extend_lenss is not None:
+        extend_prefix_lens, extend_input_lens = extend_lenss
+    else:
+        extend_prefix_lens, extend_input_lens = None, None
+
     total_prefix = sum(extend_prefix_lens) if extend_prefix_lens else 0
     total_input_tokens = sum(prefill_lens) if prefill_lens else 0 + sum(extend_input_lens) if extend_input_lens else 0
     total_tokens = total_prefix + total_input_tokens
@@ -570,7 +574,15 @@ def latency_test_custom_batch_once(
     if extend_reqs_inputs is not None:  # reqs -> prefix tokens
         extend_reqs, extend_inputs = extend_reqs_inputs
         _, _, extend_batch = extend(extend_reqs, model_runner, sample=False)
-        extend_batch.output_ids = extend_inputs
+        for i, req in enumerate(extend_reqs):
+            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.fill_ids.extend(extend_inputs[i])
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+
+        # extend_batch.output_ids = extend_inputs
+        # extend_batch.input_ids = extend_inputs
         extend_batch.prepare_for_extend(save_cache=False)  # fixme: prepare for extend方法无法将output_ids变为input_ids
 
         if extend_batch and prefill_batch:
@@ -669,7 +681,7 @@ def latency_test(
                 prefill_reqs,
                 extend_reqs,
                 prefill_lens,
-                (extend_prefixes, extend_inputs),
+                extend_lenss,
                 server_args.device,
                 bench_args.profile if tp_rank == 0 else None,
                 bench_args.profile_filename_prefix,
@@ -755,7 +767,7 @@ def gen_multi_custom_prefill_batches(multi_prefill_lens, batch_size=1):
     Generate equal size batches of prefill and extend requests
     """
     # only prefill batch
-    if isinstance(multi_prefill_lens[0], list):
+    if isinstance(multi_prefill_lens[0], list):  # full batch lens provided
         return [(pl, None) for pl in multi_prefill_lens]
     custom_batch_lens = [([pl] * batch_size, None) for pl in multi_prefill_lens]
     return custom_batch_lens
@@ -763,7 +775,7 @@ def gen_multi_custom_prefill_batches(multi_prefill_lens, batch_size=1):
 def gen_multi_custom_extend_batches(multi_extend_prefix_len, multi_extend_input_len, batch_sizes):
     # only extend batch
     assert isinstance(batch_sizes, list)
-    custom_batch_lens = [(None, [multi_extend_prefix_len] * bs, [multi_extend_input_len] * bs) for bs in batch_sizes]
+    custom_batch_lens = [(None, ([multi_extend_prefix_len] * bs, [multi_extend_input_len] * bs)) for bs in batch_sizes]
     return custom_batch_lens
 
 
@@ -788,8 +800,16 @@ if __name__ == "__main__":
         format="%(message)s",
     )
 
-    custom_batch_lens = gen_multi_custom_prefill_batches(
-        [list(range(1, 101))] * 5
+    ####### prefill batch
+    # custom_batch_lens = gen_multi_custom_prefill_batches(
+    #     [list(range(1, 101))] * 2
+    # )
+
+    ####### extend batch
+    custom_batch_lens = gen_multi_custom_extend_batches(
+        multi_extend_prefix_len=511,
+        multi_extend_input_len=1,
+        batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256],
     )
 
     try:
