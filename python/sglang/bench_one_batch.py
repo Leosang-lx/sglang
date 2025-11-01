@@ -558,7 +558,6 @@ def latency_test_custom_batch_once(
 
     profiler = None
     if profile:
-        profile_filename = f"{profile_filename_prefix}_prefix{total_prefix}_extend{total_input_tokens}.trace.json.gz"
         profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -606,6 +605,14 @@ def latency_test_custom_batch_once(
         forward_latency = time.perf_counter() - tic
         if i > 0:
             total_latency.append(forward_latency)  # the first test may be slow
+
+    if profile:
+        profiler.stop()
+        profile_filename = f"{profile_filename_prefix}_prefix{total_prefix}_extend{total_input_tokens}.trace.json.gz"
+        parent_dir = os.path.dirname(os.path.abspath(profile_filename))
+        os.makedirs(parent_dir, exist_ok=True)
+        profiler.export_chrome_trace(profile_filename)
+        rank_print(f"torch profiler chrome trace saved to {profile_filename}")
     
     avg_latency = np.mean(forward_latency)
     measurement_results['average_latency'] = avg_latency
@@ -789,12 +796,15 @@ if __name__ == "__main__":
     prefix = '/home/liux/big_file'
     # model_id = 'Qwen/Qwen3-8B'
     model_id = 'lmsys/vicuna-13b-v1.3'
+    # model_id = 'meta-llama/Llama-3.3-70B-Instruct'
     model_path = f'{prefix}/{model_id}'
 
-    mem_frac = '0.75'  # max-gpu-mem-usage
+    mem_frac = '0.5'  # max-gpu-mem-usage
     # leave space for activation tensors
 
     model_name = model_id.split('/')[1]
+
+    tp_size = '2'
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
@@ -803,7 +813,9 @@ if __name__ == "__main__":
         '--run-name', f'{model_name}',
         '--model-path', model_path,
         '--mem-fraction-static', mem_frac,
+        '--tp-size', tp_size,
         '--custom-batch',
+        '--log-level', 'DEBUG',
     ])
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
@@ -820,7 +832,7 @@ if __name__ == "__main__":
 
     ####### extend batch
     custom_batch_lens = gen_multi_custom_extend_batches(
-        multi_extend_prefix_len=127,
+        multi_extend_prefix_len=63,
         multi_extend_input_len=1,
         batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     )
