@@ -595,19 +595,22 @@ def latency_test_custom_batch_once(
 
     total_latency = []
 
-    for i in range(repeat):
+    for i in range(repeat + 1):
         synchronize(device)
         tic = time.perf_counter()
         model_worker_batch = extend_batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
         logits_output, _ = model_runner.forward(forward_batch)
-        next_token_ids = model_runner.sample(logits_output, forward_batch)
+        next_token_ids = model_runner.sample(logits_output, forward_batch)  # do not skip sampling to test the real throughput
         synchronize(device)
         forward_latency = time.perf_counter() - tic
-        total_latency.append(forward_latency)
+        if i > 0:
+            total_latency.append(forward_latency)  # the first test may be slow
     
     avg_latency = np.mean(forward_latency)
     measurement_results['average_latency'] = avg_latency
+    throughput = total_input_tokens / avg_latency
+    measurement_results["throughput"] = throughput
     # measurement_results['records'] = total_latency
     return measurement_results
 
@@ -628,6 +631,9 @@ def latency_test(
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+
+    print(f'Max tokens: {model_runner.max_total_num_tokens}')
+    print(f'Max total cache: {model_runner.token_to_kv_pool_allocator.size}')
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -781,15 +787,22 @@ def gen_multi_custom_extend_batches(multi_extend_prefix_len, multi_extend_input_
 
 if __name__ == "__main__":
     prefix = '/home/liux/big_file'
-    model_id = 'Qwen/Qwen3-8B'
-    # model_id = 'lmsys/vicuna-13b-v1.3'
+    # model_id = 'Qwen/Qwen3-8B'
+    model_id = 'lmsys/vicuna-13b-v1.3'
     model_path = f'{prefix}/{model_id}'
+
+    mem_frac = '0.75'  # max-gpu-mem-usage
+    # leave space for activation tensors
+
+    model_name = model_id.split('/')[1]
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args(args=[
+        '--run-name', f'{model_name}',
         '--model-path', model_path,
+        '--mem-fraction-static', mem_frac,
         '--custom-batch',
     ])
     server_args = ServerArgs.from_cli_args(args)
@@ -802,14 +815,14 @@ if __name__ == "__main__":
 
     ####### prefill batch
     # custom_batch_lens = gen_multi_custom_prefill_batches(
-    #     [list(range(1, 101))] * 2
+    #     [1] + list(range(100, 2001, 100))
     # )
 
     ####### extend batch
     custom_batch_lens = gen_multi_custom_extend_batches(
-        multi_extend_prefix_len=511,
+        multi_extend_prefix_len=127,
         multi_extend_input_len=1,
-        batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     )
 
     try:
