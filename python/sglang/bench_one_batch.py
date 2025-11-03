@@ -791,6 +791,16 @@ def gen_multi_custom_extend_batches(multi_extend_prefix_len, multi_extend_input_
     custom_batch_lens = [(None, ([multi_extend_prefix_len] * bs, [multi_extend_input_len] * bs)) for bs in batch_sizes]
     return custom_batch_lens
 
+####### prefill batch
+custom_batch_lens = gen_multi_custom_prefill_batches(
+    [1] + list(range(100, 2001, 100))
+)
+####### extend batch
+# custom_batch_lens = gen_multi_custom_extend_batches(
+#     multi_extend_prefix_len=127,
+#     multi_extend_input_len=1,
+#     batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+# )
 
 if __name__ == "__main__":
     prefix = '/home/liux/big_file'
@@ -799,12 +809,13 @@ if __name__ == "__main__":
     # model_id = 'meta-llama/Llama-3.3-70B-Instruct'
     model_path = f'{prefix}/{model_id}'
 
-    mem_frac = '0.5'  # max-gpu-mem-usage
+
+    mem_frac = '0.8'  # max-gpu-mem-usage
     # leave space for activation tensors
-
     model_name = model_id.split('/')[1]
-
-    tp_size = '2'
+    tp_size = '1'
+    if int(tp_size) > 1:
+        os.environ['NCCL_P2P_DISABLE'] = '1'  # some hardware do not support gpu-p2p
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
@@ -815,7 +826,8 @@ if __name__ == "__main__":
         '--mem-fraction-static', mem_frac,
         '--tp-size', tp_size,
         '--custom-batch',
-        '--log-level', 'DEBUG',
+        '--log-level', 'INFO',
+        '--enable-p2p-check',
     ])
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
@@ -823,18 +835,6 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
-    )
-
-    ####### prefill batch
-    # custom_batch_lens = gen_multi_custom_prefill_batches(
-    #     [1] + list(range(100, 2001, 100))
-    # )
-
-    ####### extend batch
-    custom_batch_lens = gen_multi_custom_extend_batches(
-        multi_extend_prefix_len=63,
-        multi_extend_input_len=1,
-        batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     )
 
     try:
