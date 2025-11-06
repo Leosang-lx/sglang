@@ -639,8 +639,8 @@ def latency_test(
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
-    print(f'Max tokens: {model_runner.max_total_num_tokens}')
-    print(f'Max total cache: {model_runner.token_to_kv_pool_allocator.size}')
+    logging.info(f'Max tokens: {model_runner.max_total_num_tokens}')
+    logging.info(f'Max total cache: {model_runner.token_to_kv_pool_allocator.size}')
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -792,30 +792,30 @@ def gen_multi_custom_extend_batches(multi_extend_prefix_len, multi_extend_input_
     return custom_batch_lens
 
 ####### prefill batch
-custom_batch_lens = gen_multi_custom_prefill_batches(
-    [1] + list(range(100, 2001, 100))
-)
-####### extend batch
-# custom_batch_lens = gen_multi_custom_extend_batches(
-#     multi_extend_prefix_len=127,
-#     multi_extend_input_len=1,
-#     batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+# custom_batch_lens = gen_multi_custom_prefill_batches(
+#     [1] + list(range(100, 2001, 100))
 # )
+####### extend batch
+custom_batch_lens = gen_multi_custom_extend_batches(
+    multi_extend_prefix_len=63,
+    multi_extend_input_len=1,
+    batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+)
 
 if __name__ == "__main__":
     prefix = '/home/liux/big_file'
     # model_id = 'Qwen/Qwen3-8B'
-    model_id = 'lmsys/vicuna-13b-v1.3'
-    # model_id = 'meta-llama/Llama-3.3-70B-Instruct'
+    # model_id = 'lmsys/vicuna-13b-v1.3'
+    model_id = 'meta-llama/Llama-3.3-70B-Instruct'
     model_path = f'{prefix}/{model_id}'
 
 
-    mem_frac = '0.8'  # max-gpu-mem-usage
+    mem_frac = '0.95'  # max-gpu-mem-usage
     # leave space for activation tensors
     model_name = model_id.split('/')[1]
-    tp_size = '1'
+    tp_size = '2'
     if int(tp_size) > 1:
-        os.environ['NCCL_P2P_DISABLE'] = '1'  # some hardware do not support gpu-p2p
+        os.environ['NCCL_P2P_DISABLE'] = '1'  # some hardware do not support nccl-p2p
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
